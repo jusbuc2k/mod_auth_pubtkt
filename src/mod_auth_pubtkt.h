@@ -30,6 +30,7 @@
 #include "apr_strings.h"
 #include "apr_uuid.h"
 #include "apr_base64.h"
+#include "apr_escape.h"
 #include "apu_version.h"
 #endif
 #ifndef ap_http_method
@@ -75,7 +76,10 @@ typedef struct  {
 	int					grace_period;
 	int					passthru_basic_auth;
 	EVP_PKEY			*pubkey;	/* public key for signature verification */
+	EVP_PKEY			*privkey;   /* private key for renewing ticket automatically when used in a reverse proxy scenario */
 	const char			*passthru_basic_key;
+	int					renew_for; /* number of seconds the new ticket will be valid for */
+	int					renew_after; /* don't renew an existing ticket unless this many seconds have elapsed since it was last renewed */
 } auth_pubtkt_dir_conf;
 
 /* Ticket structure */
@@ -84,6 +88,7 @@ typedef struct {
 	char			clientip[40];
 	unsigned int	valid_until;
 	unsigned int	grace_period;
+	unsigned int	issued;
 	char			bauth[256];
 	char			tokens[256];
 	char			user_data[256];
@@ -132,6 +137,7 @@ static unsigned int cache_hash(const char *ticket);
 
 static const char *set_auth_pubtkt_token(cmd_parms *cmd, void *cfg, const char *param);
 static const char *setup_pubkey(cmd_parms *cmd, void *cfg, const char *param);
+
 static const char *setup_passthru_basic_key(cmd_parms *cmd, void *cfg, const char *param);
 static const char *set_auth_pubtkt_debug(cmd_parms *cmd, void *cfg, const char *param);
 
@@ -152,5 +158,9 @@ static int redirect(request_rec *r, char *location);
 void dump_config(request_rec *r);
 
 static int auth_pubtkt_check(request_rec *r);
+
+static const char *setup_privkey(cmd_parms *cmd, void *cfg, const char *param);
+static char *set_ticket_value(request_rec *r, char *ticket, char *key, char *newValue);
+static int renew_ticket(request_rec *r, char* stkt, auth_pubtkt *tkt, auth_pubtkt_dir_conf *conf);
 
 #endif

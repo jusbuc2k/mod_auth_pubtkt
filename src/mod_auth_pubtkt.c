@@ -74,7 +74,10 @@ static void* create_auth_pubtkt_config(apr_pool_t *p, char* path) {
 	conf->fake_basic_auth = -1;
 	conf->passthru_basic_auth = -1;
 	conf->pubkey = NULL;
+	conf->privkey = NULL;
 	conf->passthru_basic_key = NULL;
+	conf->renew_after = 60;
+	conf->renew_for = 0;
 	return conf;
 }
 
@@ -102,7 +105,9 @@ static void* merge_auth_pubtkt_config(apr_pool_t *p, void* parent_dirv, void* su
 	conf->passthru_basic_auth = (subdir->passthru_basic_auth >= 0) ? subdir->passthru_basic_auth : parent->passthru_basic_auth;
 	conf->pubkey = (subdir->pubkey) ? subdir->pubkey : parent->pubkey;
 	conf->passthru_basic_key = (subdir->passthru_basic_key) ? subdir->passthru_basic_key : parent->passthru_basic_key;
-	
+	conf->privkey = (subdir->privkey) ? subdir->privkey : parent->privkey;
+	conf->renew_for = (subdir->renew_for >= 0) ? subdir->renew_for : parent->renew_for;
+	conf->renew_after = (subdir->renew_after >= 0) ? subdir->renew_after : parent->renew_after; 
 	return conf;
 }
 
@@ -211,6 +216,7 @@ static const char *set_auth_pubtkt_token(cmd_parms *cmd, void *cfg, const char *
 	return NULL;
 }
 
+/* Load the public key from a PEM file */
 static const char *setup_pubkey(cmd_parms *cmd, void *cfg, const char *param) {
 	FILE *fkey;
 	const char *pubkeypath;
@@ -239,6 +245,39 @@ static const char *setup_pubkey(cmd_parms *cmd, void *cfg, const char *param) {
 		  conf->pubkey->type == EVP_PKEY_DSA3 || conf->pubkey->type == EVP_PKEY_DSA4))
 		return apr_psprintf(cmd->pool, "unsupported key type %d", conf->pubkey->type);
 	
+	return NULL;
+}
+
+/* Load the private key from a PEM file */
+static const char *setup_privkey(cmd_parms *cmd, void *cfg, const char *param)
+{
+	FILE *fkey;
+	const char *privkeypath;
+	auth_pubtkt_dir_conf *conf = (auth_pubtkt_dir_conf*)cfg;
+
+	/* read private key file */
+	privkeypath = ap_server_root_relative(cmd->pool, (char*)param);
+	
+	if (!privkeypath)
+		return apr_pstrcat(cmd->pool, cmd->cmd->name, ": Invalid file path ", param, NULL);
+	
+	fkey = fopen(privkeypath, "r");
+	if (fkey == NULL)
+		return apr_psprintf(cmd->pool, "unable to open private key file '%s'", privkeypath);
+	
+	conf->privkey = PEM_read_PrivateKey(fkey, NULL, NULL, NULL);
+	fclose(fkey);
+	
+	if (conf->privkey == NULL)
+		return apr_psprintf(cmd->pool, "unable to read private key file '%s': %s",
+			privkeypath, ERR_reason_error_string(ERR_get_error()));
+	
+	/* check key type */
+	if (!(conf->privkey->type == EVP_PKEY_RSA || conf->privkey->type == EVP_PKEY_RSA2 ||
+		  conf->privkey->type == EVP_PKEY_DSA || conf->privkey->type == EVP_PKEY_DSA1 || conf->privkey->type == EVP_PKEY_DSA2 ||
+		  conf->privkey->type == EVP_PKEY_DSA3 || conf->privkey->type == EVP_PKEY_DSA4))
+		return apr_psprintf(cmd->pool, "unsupported private key type %d", conf->privkey->type);
+
 	return NULL;
 }
  
@@ -311,12 +350,21 @@ static const command_rec auth_pubtkt_cmds[] =
 	AP_INIT_TAKE1("TKTAuthPublicKey", setup_pubkey, 
 		(void *)APR_OFFSETOF(auth_pubtkt_dir_conf, pubkey),
 		OR_ALL, "public key file to use for verifying signatures"),
+	AP_INIT_TAKE1("TKTAuthPrivateKey", setup_privkey, 
+		(void *)APR_OFFSETOF(auth_pubtkt_dir_conf, pubkey),
+		OR_ALL, "private key file to use for renewing tickets"),
 	AP_INIT_TAKE1("TKTAuthPassthruBasicKey", setup_passthru_basic_key, 
 		(void *)APR_OFFSETOF(auth_pubtkt_dir_conf, pubkey),
 		OR_ALL, "key to use for decrypting passthru field, must be exactly 16 characters"),
 	AP_INIT_ITERATE("TKTAuthDebug", set_auth_pubtkt_debug, 
 		(void *)APR_OFFSETOF(auth_pubtkt_dir_conf, debug),
 		OR_AUTHCFG, "debug level (1-3, higher for more debug output)"),
+	AP_INIT_ITERATE("TKTAuthRenewFor", ap_set_int_slot, 
+		(void *)APR_OFFSETOF(auth_pubtkt_dir_conf, renew_for),
+		OR_AUTHCFG, "The number of seconds the new ticket will be valid for."),
+	AP_INIT_ITERATE("TKTAuthRenewAfter", ap_set_int_slot, 
+		(void *)APR_OFFSETOF(auth_pubtkt_dir_conf, renew_after),
+		OR_AUTHCFG, "The number of seconds that must have elapsed since last renewal before a new renewal."),
 	{NULL},
 };
 
@@ -750,6 +798,155 @@ static int check_grace_period(request_rec *r, auth_pubtkt *tkt) {
 	return ((tkt->grace_period == 0 ) || (now <= tkt->grace_period));
 }
 
+static char *set_ticket_value(request_rec *r, char *ticket, char *key, char *newValue) {
+	char *find;
+	char *posptr;
+	char *next;
+	char *left;
+	char *right;
+
+	find = apr_pstrcat(r->pool, key, "=", NULL);
+	posptr = strstr(ticket, find);
+
+	if (posptr == NULL){
+		return apr_pstrcat(r->pool, ticket, ";", key, "=", newValue, NULL);
+	}
+	
+	left = (char*)apr_palloc(r->pool, (posptr - ticket)+1);
+	apr_cpystrn(left, ticket, (posptr - ticket));
+	next = strstr(posptr, ";");
+
+	if (next == NULL){
+		right = "";
+	} else {
+		right = next;
+	}
+
+	return apr_pstrcat(r->pool, left, ";", key, "=", newValue, right, NULL);
+}
+
+/* Sign the ticket with the private key  */
+static char *sign_ticket(request_rec *r, char *ticket, auth_pubtkt_dir_conf *conf){
+	char *sigptr = strstr(ticket, ";sig=");
+	char *sig_buf;
+	char *tktval_buf;
+    EVP_MD_CTX* ctx = NULL;
+	const EVP_MD *impl;
+
+	if (sigptr == NULL) {
+		tktval_buf = ticket;
+	} else {
+		/* split ticket value and signature */
+		tktval_buf = apr_pstrndup(r->pool, ticket, (sigptr - ticket));
+	}
+
+	if (conf->privkey->type == EVP_PKEY_RSA || conf->privkey->type == EVP_PKEY_RSA2) {
+		impl = EVP_sha1();
+	} else if (conf->privkey->type == EVP_PKEY_DSA || conf->privkey->type == EVP_PKEY_DSA1 ||
+			 conf->privkey->type == EVP_PKEY_DSA2 || conf->privkey->type == EVP_PKEY_DSA3 ||
+			 conf->privkey->type == EVP_PKEY_DSA4) {
+		impl = EVP_dss1();
+	} else {
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
+			"TKT sign_ticket: invalid algorithm!");
+		return NULL;
+	}	
+
+	ERR_clear_error();
+
+ 	ctx = EVP_MD_CTX_create();
+	if (!EVP_DigestInit_ex(ctx, impl, NULL)) {
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r, "TKT sign_ticket: EVP_DigestInit_ex failed");
+		return NULL;
+	}
+
+	if (!EVP_DigestSignInit(ctx, NULL, impl, NULL, conf->privkey)) {
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
+			"TKT sign_ticket: EVP_DigestSignInit failed");
+		return NULL;	
+	}
+
+	if (!EVP_DigestSignUpdate(ctx, tktval_buf, strlen(tktval_buf))) {
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
+			"TKT sign_ticket: EVP_DigestSignUpdate failed");
+		return NULL;
+	}
+
+	size_t siglen;
+	if (!EVP_DigestSignFinal(ctx, NULL, &siglen)) {
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
+			"TKT sign_ticket: EVP_DigestSignFinal1 failed");
+		return NULL;
+	}
+	
+	sig_buf = (char*)apr_palloc(r->pool, siglen + 1);
+
+	if (!EVP_DigestSignFinal(ctx, (unsigned char*)sig_buf, &siglen)) {
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
+			"TKT sign_ticket: EVP_DigestSignFinal2 failed");
+		return NULL;
+	}
+
+	if (ctx) {
+        EVP_MD_CTX_destroy(ctx);
+        ctx = NULL;
+    }
+
+	/* allocate the sig length + NULL char */
+	char *encoded = (char *)apr_palloc(r->pool, apr_base64_encode_len(siglen));
+	/* base64 encode the signature into encoded */
+ 	apr_base64_encode(encoded, sig_buf, siglen);
+
+	/* append the signature onto the ticket string */
+	return apr_pstrcat(r->pool, tktval_buf, ";sig=", encoded, NULL);
+}
+
+/* Attempts to renew the ticket and returns 1 if it does, otherwise  */
+static int renew_ticket(request_rec *r, char *stkt, auth_pubtkt *tkt, auth_pubtkt_dir_conf *conf) {
+	time_t now = time(NULL);
+	char* cookie_value;
+	char *sigptr = strstr(stkt, ";sig=");
+	char *tktval_buf;
+	char *cookie_name = (conf->auth_cookie_name) ? conf->auth_cookie_name : AUTH_COOKIE_NAME;
+	
+	tktval_buf = apr_pstrndup(r->pool, stkt, (sigptr - stkt));
+
+	if ((now - tkt->issued) >= conf->renew_after) {
+		if (conf->debug >= 3) {
+			ap_log_rerror(APLOG_MARK, APLOG_INFO, APR_SUCCESS, r, "TKT: Ticket should be renewed.");
+		}
+
+		tkt->issued = now;
+		tkt->valid_until = now + conf->renew_for;
+
+		tktval_buf = set_ticket_value(r, tktval_buf, "issued", apr_ltoa(r->pool, tkt->issued));		
+		tktval_buf = set_ticket_value(r, tktval_buf, "validuntil", apr_ltoa(r->pool, tkt->valid_until));
+		
+		cookie_value = sign_ticket(r, tktval_buf, conf);
+
+		/* url encode the cookie value */
+		const char *val = apr_pescape_urlencoded(r->pool, cookie_value);
+		cookie_value = apr_pstrcat(r->pool, cookie_name, "=", val, NULL);
+		/*cookie_value = apr_pstrcat(r->pool, cookie_value, ";domain=", NULL);*/
+		cookie_value = apr_pstrcat(r->pool, cookie_value, "; path=/", NULL);
+		cookie_value = apr_pstrcat(r->pool, cookie_value, "; httponly", NULL);
+		if (conf->require_ssl > 0){
+			cookie_value = apr_pstrcat(r->pool, cookie_value, "; secure", NULL);
+		}
+
+		apr_table_set(r->headers_out,"Set-Cookie", cookie_value);
+
+		return 0;
+	} else {
+		if (conf->debug >= 3) {
+			ap_log_rerror(APLOG_MARK, APLOG_INFO, APR_SUCCESS, r,
+			"TKT: Ticket is not old enough. Try again later.");
+		}
+	}
+
+	return 1;
+}
+
 /* Hex conversion, from httpd util.c */
 static const char c2x_table[] = "0123456789abcdef";
 static APR_INLINE unsigned char *c2x(unsigned what, unsigned char *where) {
@@ -876,6 +1073,8 @@ void dump_config(request_rec *r) {
 		fprintf(stderr,"TKTAuthDebug: %d\n",                conf->debug);
 		fprintf(stderr,"TKTAuthFakeBasicAuth: %d\n", 	    conf->fake_basic_auth);
 		fprintf(stderr,"TKTAuthPassthruBasicAuth: %d\n", 	conf->passthru_basic_auth);
+		fprintf(stderr,"TKTAuthRenewAfter: %d\n", 			conf->renew_after);
+		fprintf(stderr,"TKTAuthRenewFor: %d\n", 			conf->renew_for);
 		fflush(stderr);
 	}
 }
@@ -968,6 +1167,16 @@ static int auth_pubtkt_check(request_rec *r) {
 			url = conf->timeout_url ? conf->timeout_url : conf->login_url;
 		
 		return redirect(r, url);
+	}
+
+	/* if the ticket can be renewed, go ahead and do that */
+	if (conf->renew_for > 0) {
+		if (conf->privkey == NULL) {
+			ap_log_rerror(APLOG_MARK, APLOG_INFO, APR_SUCCESS, r,
+				"TKT: No private key is configured; ticket cannot be automatically renewed.");
+		} else {
+			renew_ticket(r, ticket, parsed, conf);
+		}
 	}
 	
 	/* Attempt to refresh cookie if it will expires - redirect on get if so */

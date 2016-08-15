@@ -1,0 +1,7 @@
+src/.libs
+*.la
+*.lai
+*.lo
+*.slo
+Makedefs
+.vscode/
